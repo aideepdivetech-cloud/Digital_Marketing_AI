@@ -1,0 +1,263 @@
+version: '3.9'
+
+# ============================================================================
+# DIGITAL MARKETING AI AGENT PLATFORM — Docker Compose
+# ============================================================================
+# Services: postgres, redis, qdrant, minio, ollama, api, worker, scheduler
+# ============================================================================
+
+services:
+
+  # ── PostgreSQL 16 (Primary Database — 34 tables) ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: dma-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-marketing_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-marketing_ai_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --locale=en_US.UTF-8"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-marketing_ai_user} -d ${POSTGRES_DB:-marketing_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # RAM optimization: conservative shared_buffers for 16GB host
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c effective_cache_size=512MB
+        -c work_mem=4MB
+        -c maintenance_work_mem=64MB
+        -c max_connections=100
+        -c log_min_duration_statement=1000
+
+  # ── Redis 7 (Cache + Broker + Event Bus + Locks) ──
+  redis:
+    image: redis:7-alpine
+    container_name: dma-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    # RAM optimization: limit to 512MB
+    command: >
+      redis-server
+        --maxmemory 512mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1000
+        --appendonly yes
+
+  # ── Qdrant (Vector Database — Agent Memory + RAG) ──
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: dma-qdrant
+    restart: unless-stopped
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+      # RAM optimization: use disk-backed storage
+      QDRANT__STORAGE__ON_DISK_PAYLOAD: "true"
+      QDRANT__STORAGE__OPTIMIZERS__MEMMAP_THRESHOLD_KB: 20000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO (S3-Compatible Object Storage — Artifacts, Uploads) ──
+  minio:
+    image: minio/minio:latest
+    container_name: dma-minio
+    restart: unless-stopped
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ── MinIO Init (Create default bucket on startup) ──
+  minio-init:
+    image: minio/mc:latest
+    container_name: dma-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set dma http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      mc mb dma/${MINIO_DEFAULT_BUCKET:-artifacts} --ignore-existing;
+      mc mb dma/uploads --ignore-existing;
+      mc mb dma/backups --ignore-existing;
+      exit 0;
+      "
+
+  # ── Ollama (Self-Hosted LLM Inference Server) ──
+  ollama:
+    image: ollama/ollama:latest
+    container_name: dma-ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # Uncomment the deploy block below if you get an NVIDIA GPU later
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:11434/api/tags"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # ── FastAPI Application Server ──
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dma-api
+    restart: unless-stopped
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      - APP_ENV=${APP_ENV:-development}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-marketing_ai_user}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-marketing_ai}
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-marketing_ai_user}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-marketing_ai}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - MINIO_HOST=minio
+      - MINIO_PORT=9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - BOSS_AGENT_MODEL=${BOSS_AGENT_MODEL:-llama3.2:3b-instruct-q4_K_M}
+      - SUB_AGENT_MODEL=${SUB_AGENT_MODEL:-llama3.2:1b-instruct-q4_K_M}
+      - FALLBACK_MODEL=${FALLBACK_MODEL:-llama3.2:1b-instruct-q4_K_M}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL:-nomic-embed-text}
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - ./backend:/app
+      - ./prompts:/app/prompts
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    command: >
+      uvicorn app.main:app
+        --host 0.0.0.0
+        --port 8000
+        --reload
+        --log-level info
+
+  # ── Celery Worker (Background Task Processing) ──
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dma-worker
+    restart: unless-stopped
+    environment:
+      - APP_ENV=${APP_ENV:-development}
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-marketing_ai_user}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-marketing_ai}
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-marketing_ai_user}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-marketing_ai}
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - MINIO_HOST=minio
+      - MINIO_PORT=9000
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER:-minioadmin}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - SECRET_KEY=${SECRET_KEY:-dev-secret-key-change-in-production}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:-0123456789abcdef0123456789abcdef}
+    volumes:
+      - ./backend:/app
+      - ./prompts:/app/prompts
+      - ./logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A workers.celery_app worker
+        --loglevel=info
+        --concurrency=2
+        --max-tasks-per-child=100
+        -Q default,scheduled,heavy
+
+  # ── Celery Beat (Scheduled Task Scheduler) ──
+  scheduler:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: dma-scheduler
+    restart: unless-stopped
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - DATABASE_URL_SYNC=postgresql://${POSTGRES_USER:-marketing_ai_user}:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/${POSTGRES_DB:-marketing_ai}
+    volumes:
+      - ./backend:/app
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: >
+      celery -A workers.celery_app beat
+        --loglevel=info
+        --scheduler celery.beat:PersistentScheduler
+        --schedule /tmp/celerybeat-schedule
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  qdrant_data:
+    driver: local
+  minio_data:
+    driver: local
+  ollama_data:
+    driver: local
